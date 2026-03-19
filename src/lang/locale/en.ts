@@ -37,6 +37,8 @@ export const en = {
 	NotionLinkDisplayDesc: "If disabled, the Notion link won't be added to the front matter after syncing (default: on).",
 	AutoCopyNotionLink: "Auto-copy Notion Link",
 	AutoCopyNotionLinkDesc: "Automatically copy the Notion page link to the clipboard after syncing (default: on).",
+	AutoCompressOversizedImages: "Auto-compress oversized images",
+	AutoCompressOversizedImagesDesc: "Automatically compress images that exceed Notion's 5MB upload limit before uploading (default: on).",
 	AutoSync: "Auto Sync",
 	AutoSyncDesc: "Automatically syncs changes to Notion when the file's frontmatter or content is modified. Supports creating and updating pages.",
 	AutoSyncFrontmatterKey: "Auto Sync Frontmatter Key",

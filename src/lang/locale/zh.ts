@@ -37,6 +37,8 @@ export const zh = {
 	NotionLinkDisplayDesc: "默认开启。关闭后，同步成功时 frontmatter 中不会出现 Notion 链接",
 	AutoCopyNotionLink: "自动复制 Notion 链接",
 	AutoCopyNotionLinkDesc: "同步后自动将 Notion 链接复制到剪贴板（默认开启）",
+	AutoCompressOversizedImages: "自动压缩超限图片",
+	AutoCompressOversizedImagesDesc: "图片超过 Notion 5MB 上传限制时，自动压缩后再上传（默认开启）",
 	AutoSync: "自动同步",
 	AutoSyncDesc: "当文档的 frontmatter 或内容修改时，将自动同步到 Notion（支持新建和更新）",
 	AutoSyncFrontmatterKey: "自动同步 Frontmatter 键名",

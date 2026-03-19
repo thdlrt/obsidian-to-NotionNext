@@ -15,6 +15,7 @@ export interface PluginSettings {
 	notionUser: string;
 	NotionLinkDisplay: boolean;
 	autoCopyNotionLink: boolean;
+	autoCompressOversizedImages: boolean;
 	autoSync: boolean;
 	autoSyncDelay: number;
 	autoSyncSuccessNotice: boolean;
@@ -56,6 +57,7 @@ export const DEFAULT_SETTINGS: PluginSettings = {
 	notionUser: "",
 	NotionLinkDisplay: true,
 	autoCopyNotionLink: true,
+	autoCompressOversizedImages: true,
 	autoSync: false,
 	autoSyncDelay: 5,
 	autoSyncSuccessNotice: false,
@@ -100,6 +102,8 @@ export class ObsidianSettingTab extends PluginSettingTab {
 		this.createSettingEl(containerEl, i18nConfig.NotionLinkDisplay, i18nConfig.NotionLinkDisplayDesc, 'toggle', i18nConfig.NotionLinkDisplay, this.plugin.settings.NotionLinkDisplay, 'NotionLinkDisplay')
 
 		this.createSettingEl(containerEl, i18nConfig.AutoCopyNotionLink, i18nConfig.AutoCopyNotionLinkDesc, 'toggle', i18nConfig.AutoCopyNotionLink, this.plugin.settings.autoCopyNotionLink, 'autoCopyNotionLink')
+
+		this.createSettingEl(containerEl, i18nConfig.AutoCompressOversizedImages, i18nConfig.AutoCompressOversizedImagesDesc, 'toggle', i18nConfig.AutoCompressOversizedImages, this.plugin.settings.autoCompressOversizedImages, 'autoCompressOversizedImages')
 
 		this.createSettingEl(containerEl, i18nConfig.AutoSync, i18nConfig.AutoSyncDesc, 'toggle', i18nConfig.AutoSync, this.plugin.settings.autoSync, 'autoSync')
 		this.createSettingEl(

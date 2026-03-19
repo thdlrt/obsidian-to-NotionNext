@@ -7,6 +7,28 @@
 ### Changed
 
 ### Fixed
+
+## 2.8.7 (2026-03-19)
+
+### Fixed
+
+- Added table-safe attachment rewrite mode: attachment references inside markdown table rows are downgraded to plain text to avoid breaking table column structure.
+- Reduced Notion `Number of cells in table row must match the table width` validation failures caused by attachment placeholders/newlines in table cells.
+
+## 2.8.6 (2026-03-19)
+
+### Fixed
+
+- Improved failed attachment fallback: when local/external attachment upload is skipped or fails, the reference is now replaced with plain filename text to keep markdown structure stable.
+- Prevented table structure breakage caused by unresolved attachment syntax in complex content (e.g., table cells), reducing Notion `table width` validation errors.
+
+## 2.8.5 (2026-03-19)
+
+### Fixed
+
+- Improved attachment upload robustness: oversized local files (>5MB) are skipped with warnings instead of producing noisy upload errors, so note sync can continue.
+- Improved markdown image rewrite fallback for list-prefixed image syntax and rich-text link forms, reducing missing images for cases like `- ![image](url)`.
+
 ## 2.8.4 (2026-03-04)
 
 ### Fixed

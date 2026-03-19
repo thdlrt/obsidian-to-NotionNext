@@ -98,12 +98,15 @@ export default class ObsidianSyncNotionPlugin extends Plugin {
         if (typeof this.settings.NotionLinkDisplay !== 'boolean') {
             this.settings.NotionLinkDisplay = DEFAULT_SETTINGS.NotionLinkDisplay;
         }
-        if (typeof this.settings.autoCopyNotionLink !== 'boolean') {
-            this.settings.autoCopyNotionLink = DEFAULT_SETTINGS.autoCopyNotionLink;
-        }
-        if (typeof this.settings.autoSyncFrontmatterKey !== 'string') {
-            this.settings.autoSyncFrontmatterKey = DEFAULT_AUTO_SYNC_DATABASE_KEY;
-        }
+		if (typeof this.settings.autoCopyNotionLink !== 'boolean') {
+			this.settings.autoCopyNotionLink = DEFAULT_SETTINGS.autoCopyNotionLink;
+		}
+		if (typeof this.settings.autoCompressOversizedImages !== 'boolean') {
+			this.settings.autoCompressOversizedImages = DEFAULT_SETTINGS.autoCompressOversizedImages;
+		}
+		if (typeof this.settings.autoSyncFrontmatterKey !== 'string') {
+			this.settings.autoSyncFrontmatterKey = DEFAULT_AUTO_SYNC_DATABASE_KEY;
+		}
         this.settings.autoSyncFrontmatterKey = resolveAutoSyncKey(this.settings.autoSyncFrontmatterKey);
 
         // Ensure databaseDetails exists
@@ -112,13 +115,14 @@ export default class ObsidianSyncNotionPlugin extends Plugin {
         }
 
         // Save settings if any migration was needed
-        const needsSave = !loadedData ||
-            loadedData.autoSync === undefined ||
-            loadedData.autoSyncDelay === undefined ||
-            loadedData.autoSyncSuccessNotice === undefined ||
-            loadedData.NotionLinkDisplay === undefined ||
-            loadedData.autoCopyNotionLink === undefined ||
-            loadedData.autoSyncFrontmatterKey === undefined;
+		const needsSave = !loadedData ||
+			loadedData.autoSync === undefined ||
+			loadedData.autoSyncDelay === undefined ||
+			loadedData.autoSyncSuccessNotice === undefined ||
+			loadedData.NotionLinkDisplay === undefined ||
+			loadedData.autoCopyNotionLink === undefined ||
+			loadedData.autoCompressOversizedImages === undefined ||
+			loadedData.autoSyncFrontmatterKey === undefined;
 
         if (needsSave) {
             const migratedFields = [];
@@ -129,9 +133,10 @@ export default class ObsidianSyncNotionPlugin extends Plugin {
                 if (loadedData.autoSyncDelay === undefined) migratedFields.push('autoSyncDelay');
                 if (loadedData.autoSyncSuccessNotice === undefined) migratedFields.push('autoSyncSuccessNotice');
                 if (loadedData.NotionLinkDisplay === undefined) migratedFields.push('NotionLinkDisplay');
-                if (loadedData.autoCopyNotionLink === undefined) migratedFields.push('autoCopyNotionLink');
+				if (loadedData.autoCopyNotionLink === undefined) migratedFields.push('autoCopyNotionLink');
+				if (loadedData.autoCompressOversizedImages === undefined) migratedFields.push('autoCompressOversizedImages');
 
-                console.log('[Settings] Migrating settings, adding fields:', migratedFields.join(', '));
+				console.log('[Settings] Migrating settings, adding fields:', migratedFields.join(', '));
             }
 
             await this.saveSettings();
@@ -176,11 +181,15 @@ export default class ObsidianSyncNotionPlugin extends Plugin {
             console.warn('[Settings] Invalid NotionLinkDisplay value, resetting to default');
             this.settings.NotionLinkDisplay = DEFAULT_SETTINGS.NotionLinkDisplay;
         }
-        if (typeof this.settings.autoCopyNotionLink !== 'boolean') {
-            console.warn('[Settings] Invalid autoCopyNotionLink value, resetting to default');
-            this.settings.autoCopyNotionLink = DEFAULT_SETTINGS.autoCopyNotionLink;
-        }
-        if (!this.settings.databaseDetails || typeof this.settings.databaseDetails !== 'object') {
+		if (typeof this.settings.autoCopyNotionLink !== 'boolean') {
+			console.warn('[Settings] Invalid autoCopyNotionLink value, resetting to default');
+			this.settings.autoCopyNotionLink = DEFAULT_SETTINGS.autoCopyNotionLink;
+		}
+		if (typeof this.settings.autoCompressOversizedImages !== 'boolean') {
+			console.warn('[Settings] Invalid autoCompressOversizedImages value, resetting to default');
+			this.settings.autoCompressOversizedImages = DEFAULT_SETTINGS.autoCompressOversizedImages;
+		}
+		if (!this.settings.databaseDetails || typeof this.settings.databaseDetails !== 'object') {
             console.warn('[Settings] Invalid databaseDetails, resetting to empty object');
             this.settings.databaseDetails = {};
         }

@@ -4,6 +4,14 @@ import type { DatabaseDetails } from "../../ui/settingTabs";
 
 const NOTION_API_VERSION = "2025-09-03";
 const MAX_UPLOAD_BYTES = 5 * 1024 * 1024;
+const AUTO_COMPRESSIBLE_IMAGE_EXTENSIONS = new Set(["png", "jpg", "jpeg", "webp", "bmp"]);
+
+interface PreparedUploadPayload {
+	id: string;
+	filename: string;
+	binary: ArrayBuffer;
+	contentType: string;
+}
 
 interface FileUploadSession {
 	id: string;
@@ -29,19 +37,12 @@ export class AttachmentUploader {
 	async uploadFile(file: TFile): Promise<UploadResult> {
 		const { notionAPI } = this.dbDetails;
 		const fileSizeBytes = file.stat?.size ?? 0;
-		const contentType = this.getContentType(file.extension);
-
-		if (fileSizeBytes > MAX_UPLOAD_BYTES) {
-			throw new Error(
-				`File too large for Notion upload (max 5MB): ${file.path} (${(fileSizeBytes / 1024 / 1024).toFixed(2)} MB)`,
-			);
-		}
 		const mode = "single_part";
 
 		console.log(`[AttachmentUploader] uploadFile: ${file.name}`, {
 			path: file.path,
 			size: `${(fileSizeBytes / 1024).toFixed(2)} KB`,
-			contentType,
+			contentType: this.getContentType(file.extension),
 			mode,
 		});
 
@@ -56,21 +57,195 @@ export class AttachmentUploader {
 		});
 
 		const binary = await this.plugin.app.vault.readBinary(file);
-		console.log(`[AttachmentUploader] Read binary data: ${binary.byteLength} bytes`);
-
-		if (binary.byteLength > MAX_UPLOAD_BYTES) {
-			throw new Error(
-				`File too large for Notion upload (max 5MB): ${file.path} (${(binary.byteLength / 1024 / 1024).toFixed(2)} MB)`,
-			);
-		}
+		const payload = await this.prepareUploadPayload(binary, file.name, file.extension, file.path);
+		console.log(`[AttachmentUploader] Prepared binary data: ${payload.binary.byteLength} bytes`, {
+			filename: payload.filename,
+			contentType: payload.contentType,
+		});
 
 		const uploadUrl =
 			session.upload_url ??
 			`https://api.notion.com/v1/file_uploads/${encodeURIComponent(session.id)}/send`;
-		await this.sendFileData(session.id, uploadUrl, binary, notionAPI, file.name, contentType);
+		await this.sendFileData(session.id, uploadUrl, payload.binary, notionAPI, payload.filename, payload.contentType);
 
 		console.log(`[AttachmentUploader] Upload complete: ${file.name} -> ${session.id}`);
-		return { id: session.id, filename: file.name };
+		return { id: session.id, filename: payload.filename };
+	}
+
+	async uploadBuffer(binary: ArrayBuffer, filename: string, extension: string): Promise<UploadResult> {
+		const { notionAPI } = this.dbDetails;
+		const payload = await this.prepareUploadPayload(binary, filename, extension, filename);
+
+		const mode = "single_part";
+		console.log(`[AttachmentUploader] uploadBuffer: ${filename}`, {
+			size: `${(payload.binary.byteLength / 1024).toFixed(2)} KB`,
+			contentType: payload.contentType,
+			mode,
+		});
+
+		const session = await this.createUploadSession({ mode, notionAPI });
+		console.log(`[AttachmentUploader] Upload session created for buffer:`, {
+			sessionId: session.id,
+			status: session.status,
+		});
+
+		const uploadUrl =
+			session.upload_url ??
+			`https://api.notion.com/v1/file_uploads/${encodeURIComponent(session.id)}/send`;
+		await this.sendFileData(session.id, uploadUrl, payload.binary, notionAPI, payload.filename, payload.contentType);
+
+		console.log(`[AttachmentUploader] Buffer upload complete: ${filename} -> ${session.id}`);
+		return { id: session.id, filename: payload.filename };
+	}
+
+	private async prepareUploadPayload(
+		binary: ArrayBuffer,
+		filename: string,
+		extension: string,
+		sourceLabel: string,
+	): Promise<PreparedUploadPayload> {
+		const normalizedExtension = extension.toLowerCase();
+		if (binary.byteLength <= MAX_UPLOAD_BYTES) {
+			return {
+				id: sourceLabel,
+				filename,
+				binary,
+				contentType: this.getContentType(normalizedExtension),
+			};
+		}
+
+		if (!AUTO_COMPRESSIBLE_IMAGE_EXTENSIONS.has(normalizedExtension)) {
+			throw new Error(
+				`File too large for Notion upload (max 5MB): ${sourceLabel} (${(binary.byteLength / 1024 / 1024).toFixed(2)} MB)`,
+			);
+		}
+
+		if (!this.plugin.settings.autoCompressOversizedImages) {
+			throw new Error(
+				`Image exceeds Notion upload limit and auto-compression is disabled: ${sourceLabel} (${(binary.byteLength / 1024 / 1024).toFixed(2)} MB)`,
+			);
+		}
+
+		console.warn(`[AttachmentUploader] Image exceeds 5MB, attempting compression`, {
+			source: sourceLabel,
+			originalSizeMB: (binary.byteLength / 1024 / 1024).toFixed(2),
+			extension: normalizedExtension,
+		});
+
+		const compressed = await this.compressImageToFit(binary, normalizedExtension, filename);
+		if (compressed.binary.byteLength > MAX_UPLOAD_BYTES) {
+			throw new Error(
+				`Compressed image is still too large for Notion upload (max 5MB): ${sourceLabel} (${(compressed.binary.byteLength / 1024 / 1024).toFixed(2)} MB)`,
+			);
+		}
+
+		console.log(`[AttachmentUploader] Image compressed successfully`, {
+			source: sourceLabel,
+			outputFilename: compressed.filename,
+			compressedSizeMB: (compressed.binary.byteLength / 1024 / 1024).toFixed(2),
+			contentType: compressed.contentType,
+		});
+
+		return {
+			id: sourceLabel,
+			filename: compressed.filename,
+			binary: compressed.binary,
+			contentType: compressed.contentType,
+		};
+	}
+
+	private async compressImageToFit(
+		binary: ArrayBuffer,
+		extension: string,
+		filename: string,
+	): Promise<{ binary: ArrayBuffer; filename: string; contentType: string }> {
+		const sourceMime = this.getContentType(extension);
+		const image = await this.loadImage(binary, sourceMime);
+		const baseName = filename.replace(/\.[^.]+$/, "") || "image";
+		const targetType = "image/webp";
+		const targetExtension = "webp";
+
+		const scales = [1, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.25];
+		const qualities = [0.92, 0.86, 0.8, 0.72, 0.64, 0.56, 0.48, 0.4];
+
+		let best: Blob | null = null;
+		let bestSize = Number.POSITIVE_INFINITY;
+
+		for (const scale of scales) {
+			const width = Math.max(1, Math.round(image.width * scale));
+			const height = Math.max(1, Math.round(image.height * scale));
+
+			for (const quality of qualities) {
+				const blob = await this.renderImageBlob(image, width, height, targetType, quality);
+				if (blob.size < bestSize) {
+					best = blob;
+					bestSize = blob.size;
+				}
+
+				if (blob.size <= MAX_UPLOAD_BYTES) {
+					return {
+						binary: await blob.arrayBuffer(),
+						filename: `${baseName}.${targetExtension}`,
+						contentType: targetType,
+					};
+				}
+			}
+		}
+
+		if (!best) {
+			throw new Error(`Failed to compress image: ${filename}`);
+		}
+
+		return {
+			binary: await best.arrayBuffer(),
+			filename: `${baseName}.${targetExtension}`,
+			contentType: targetType,
+		};
+	}
+
+	private async loadImage(binary: ArrayBuffer, contentType: string): Promise<HTMLImageElement> {
+		const blob = new Blob([binary], { type: contentType || "application/octet-stream" });
+		const objectUrl = URL.createObjectURL(blob);
+
+		try {
+			const image = await new Promise<HTMLImageElement>((resolve, reject) => {
+				const img = new Image();
+				img.onload = () => resolve(img);
+				img.onerror = () => reject(new Error("Failed to decode image for compression"));
+				img.src = objectUrl;
+			});
+			return image;
+		} finally {
+			URL.revokeObjectURL(objectUrl);
+		}
+	}
+
+	private async renderImageBlob(
+		image: HTMLImageElement,
+		width: number,
+		height: number,
+		contentType: string,
+		quality: number,
+	): Promise<Blob> {
+		const canvas = document.createElement("canvas");
+		canvas.width = width;
+		canvas.height = height;
+		const context = canvas.getContext("2d");
+		if (!context) {
+			throw new Error("Failed to create canvas context for image compression");
+		}
+
+		context.drawImage(image, 0, 0, width, height);
+
+		return await new Promise<Blob>((resolve, reject) => {
+			canvas.toBlob((blob) => {
+				if (!blob) {
+					reject(new Error("Canvas compression returned empty blob"));
+					return;
+				}
+				resolve(blob);
+			}, contentType, quality);
+		});
 	}
 
 	private async createUploadSession(params: {

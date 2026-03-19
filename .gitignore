@@ -31,3 +31,5 @@ docs/.vitepress/cache
 
 # claude code
 .claude
+share-to-notionnext-2.8.4.zip
+package-lock.json

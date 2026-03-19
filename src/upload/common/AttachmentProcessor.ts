@@ -1,4 +1,4 @@
-import { App, TFile, normalizePath } from "obsidian";
+import { App, TFile, normalizePath, requestUrl } from "obsidian";
 import { AttachmentUploader } from "./AttachmentUploader";
 import type MyPlugin from "src/main";
 import type { DatabaseDetails } from "../../ui/settingTabs";
@@ -14,6 +14,17 @@ interface LocalAttachment {
 	originalRef: string;
 }
 
+interface ExternalImageAttachment {
+	url: string;
+	originalRef: string;
+}
+
+interface CachedExternalImage {
+	binary: ArrayBuffer;
+	filename: string;
+	extension: string;
+}
+
 const IMAGE_EXTENSIONS = new Set([
 	"png", "jpg", "jpeg", "gif", "webp", "svg", "heic", "tif", "tiff", "bmp"
 ]);
@@ -21,6 +32,20 @@ const IMAGE_EXTENSIONS = new Set([
 const SUPPORTED_EXTENSIONS = new Set([
 	...IMAGE_EXTENSIONS, "pdf"
 ]);
+
+const NOTION_MAX_UPLOAD_BYTES = 5 * 1024 * 1024;
+
+const REMOTE_IMAGE_EXTENSIONS = new Set(IMAGE_EXTENSIONS);
+const REMOTE_IMAGE_CONTENT_TYPE_TO_EXT: Record<string, string> = {
+	"image/png": "png",
+	"image/jpeg": "jpg",
+	"image/gif": "gif",
+	"image/webp": "webp",
+	"image/svg+xml": "svg",
+	"image/heic": "heic",
+	"image/tiff": "tiff",
+	"image/bmp": "bmp",
+};
 
 export class AttachmentProcessor {
 	private plugin: MyPlugin;
@@ -40,6 +65,32 @@ export class AttachmentProcessor {
 		const before = input.slice(lineStart, offset).trim();
 		const after = input.slice(offset + match.length, lineEnd).trim();
 		return before.length === 0 && after.length === 0;
+	}
+
+	private isLikelyInTableLine(input: string, offset: number, match: string): boolean {
+		const lineStart = input.lastIndexOf("\n", Math.max(0, offset - 1)) + 1;
+		const lineEndIdx = input.indexOf("\n", offset + match.length);
+		const lineEnd = lineEndIdx === -1 ? input.length : lineEndIdx;
+		const line = input.slice(lineStart, lineEnd).trim();
+
+		// Heuristic: markdown table rows typically contain at least two pipe delimiters.
+		const pipeCount = (line.match(/\|/g) || []).length;
+		if (pipeCount < 2) return false;
+
+		// Exclude fenced code-like content just in case.
+		if (line.startsWith("```") || line.endsWith("```")) return false;
+
+		return true;
+	}
+
+	private toSafeTableCellText(value: string | undefined, fallback: string): string {
+		const normalized = (value ?? fallback)
+			.replace(/[\r\n]+/g, " ")
+			.replace(/\|/g, " / ")
+			.replace(/\s+/g, " ")
+			.trim();
+
+		return normalized || fallback;
 	}
 
 	hasInternalAttachments(content: string, sourceFile: TFile): boolean {
@@ -96,7 +147,7 @@ export class AttachmentProcessor {
 		});
 		console.log(`[AttachmentProcessor] Stripped ${codeBlockPlaceholders.length} code blocks`);
 
-		const { internal, external } = this.collectAttachments(contentWithoutCode, sourceFile);
+		const { internal, external, externalImages } = this.collectAttachments(contentWithoutCode, sourceFile);
 
 		if (external.length > 0) {
 			console.log(`[AttachmentProcessor] Found ${external.length} external reference(s) (will be skipped):`);
@@ -105,7 +156,7 @@ export class AttachmentProcessor {
 			});
 		}
 
-		if (internal.length === 0) {
+		if (internal.length === 0 && externalImages.length === 0) {
 			console.log(`[AttachmentProcessor] No internal attachments found in ${sourceFile.path}`);
 			return {
 				content,
@@ -122,24 +173,91 @@ export class AttachmentProcessor {
 		});
 
 		const uploadedMap = new Map<string, { id: string; file: TFile }>();
+		const uploadedExternalMap = new Map<string, { id: string; filename: string; extension: string }>();
+		const temporaryExternalCache = new Map<string, CachedExternalImage>();
+		const skippedLargeFiles: string[] = [];
+		const failedLocalFallbackNameByPath = new Map<string, string>();
+		const failedExternalFallbackNameByUrl = new Map<string, string>();
 
 		for (const attachment of internal) {
 			try {
+				const fileSize = attachment.file.stat?.size ?? 0;
+				if (fileSize > NOTION_MAX_UPLOAD_BYTES && !this.isImage(attachment.file)) {
+					const sizeMB = ((attachment.file.stat?.size ?? 0) / 1024 / 1024).toFixed(2);
+					skippedLargeFiles.push(`${attachment.file.path} (${sizeMB} MB)`);
+					failedLocalFallbackNameByPath.set(attachment.file.path, attachment.file.name);
+					console.warn(`[AttachmentProcessor] ⊘ Skipped oversized file (>5MB): ${attachment.file.path} (${sizeMB} MB)`);
+					continue;
+				}
+
+				if (fileSize > NOTION_MAX_UPLOAD_BYTES && this.isImage(attachment.file)) {
+					console.warn(`[AttachmentProcessor] Image exceeds 5MB and will be auto-compressed before upload: ${attachment.file.path}`);
+				}
+
 				console.log(`[AttachmentProcessor] Uploading: ${attachment.file.path} (${(attachment.file.stat.size / 1024).toFixed(2)} KB)`);
 				const result = await this.uploader.uploadFile(attachment.file);
 				uploadedMap.set(attachment.file.path, { id: result.id, file: attachment.file });
 				console.log(`[AttachmentProcessor] ✓ Uploaded successfully: ${attachment.file.name} -> ${result.id}`);
 			} catch (error) {
+				failedLocalFallbackNameByPath.set(attachment.file.path, attachment.file.name);
 				console.error(`[AttachmentProcessor] ✗ Failed to upload ${attachment.file.path}:`, error);
 			}
 		}
 
-		console.log(`[AttachmentProcessor] Upload complete: ${uploadedMap.size}/${internal.length} successful`);
+		if (skippedLargeFiles.length > 0) {
+			console.warn(`[AttachmentProcessor] Skipped ${skippedLargeFiles.length} oversized internal attachment(s):`);
+			skippedLargeFiles.forEach((item, idx) => {
+				console.warn(`  ${idx + 1}. ${item}`);
+			});
+		}
 
-		const rewriteResult = this.rewriteContent(contentWithoutCode, sourceFile, uploadedMap);
+		if (externalImages.length > 0) {
+			console.log(`[AttachmentProcessor] Found ${externalImages.length} external image(s) to cache & upload`);
+		}
+
+		try {
+			for (const attachment of externalImages) {
+				try {
+					let cached = temporaryExternalCache.get(attachment.url);
+					if (!cached) {
+						cached = await this.downloadExternalImageToTempCache(attachment.url);
+						temporaryExternalCache.set(attachment.url, cached);
+					}
+
+					const result = await this.uploader.uploadBuffer(cached.binary, cached.filename, cached.extension);
+					uploadedExternalMap.set(attachment.url, {
+						id: result.id,
+						filename: cached.filename,
+						extension: cached.extension,
+					});
+					console.log(`[AttachmentProcessor] ✓ Uploaded external image: ${attachment.url} -> ${result.id}`);
+				} catch (error) {
+					const fallbackName = this.resolveRemoteFilename(attachment.url, "image");
+					failedExternalFallbackNameByUrl.set(attachment.url, fallbackName);
+					console.error(`[AttachmentProcessor] ✗ Failed to upload external image ${attachment.url}:`, error);
+				}
+			}
+		} finally {
+			const cacheCount = temporaryExternalCache.size;
+			temporaryExternalCache.clear();
+			if (cacheCount > 0) {
+				console.log(`[AttachmentProcessor] Cleared ${cacheCount} temporary cached external image(s)`);
+			}
+		}
+
+		console.log(`[AttachmentProcessor] Upload complete: ${uploadedMap.size}/${internal.length} internal successful, ${uploadedExternalMap.size}/${externalImages.length} external successful`);
+
+		const rewriteResult = this.rewriteContent(
+			contentWithoutCode,
+			sourceFile,
+			uploadedMap,
+			uploadedExternalMap,
+			failedLocalFallbackNameByPath,
+			failedExternalFallbackNameByUrl,
+		);
 
 		// Restore code blocks
-		let restoredContent = rewriteResult.content;
+		let restoredContent = this.normalizeListMediaBlocks(rewriteResult.content);
 		codeBlockPlaceholders.forEach((code, idx) => {
 			restoredContent = restoredContent.replace(`__CODE_BLOCK_${idx}__`, code);
 		});
@@ -156,10 +274,58 @@ export class AttachmentProcessor {
 		};
 	}
 
-	private collectAttachments(content: string, sourceFile: TFile): { internal: LocalAttachment[]; external: string[] } {
+	private normalizeListMediaBlocks(content: string): string {
+		const lines = content.split("\n");
+		const output: string[] = [];
+		const taskRegex = /^(\s*[-*+]\s+\[[ xX]\]\s+)(.*)$/;
+		const listRegex = /^(\s*(?:[-*+]|\d+\.)\s+)(.*)$/;
+		const mediaTokenRegex = /!\[[^\]]*\]\([^\)]+\)|`__NOTION_FILE_UPLOAD__:[^`]+`/g;
+
+		for (const line of lines) {
+			const taskMatch = line.match(taskRegex);
+			const listMatch = taskMatch ?? line.match(listRegex);
+			if (!listMatch) {
+				output.push(line);
+				continue;
+			}
+
+			const prefix = listMatch[1];
+			const body = listMatch[2] ?? "";
+			const mediaTokens = body.match(mediaTokenRegex) ?? [];
+			if (mediaTokens.length === 0) {
+				output.push(line);
+				continue;
+			}
+
+			const textOnly = body
+				.replace(mediaTokenRegex, " ")
+				.replace(/\s+/g, " ")
+				.trim();
+
+			if (!textOnly) {
+				output.push(line);
+				continue;
+			}
+
+			output.push(`${prefix}${textOnly}`);
+
+			const indentMatch = prefix.match(/^\s*/);
+			const childIndent = `${indentMatch?.[0] ?? ""}  `;
+			for (const token of mediaTokens) {
+				output.push("");
+				output.push(`${childIndent}${token}`);
+			}
+		}
+
+		return output.join("\n");
+	}
+
+	private collectAttachments(content: string, sourceFile: TFile): { internal: LocalAttachment[]; external: string[]; externalImages: ExternalImageAttachment[] } {
 		const internal: LocalAttachment[] = [];
 		const external: string[] = [];
+		const externalImages: ExternalImageAttachment[] = [];
 		const seen = new Set<string>();
+		const seenExternalImageUrl = new Set<string>();
 		const app = this.plugin.app;
 
 		console.log(`[AttachmentProcessor] Scanning for attachments in content (${content.length} chars)`);
@@ -178,6 +344,17 @@ export class AttachmentProcessor {
 			embedCount++;
 			const rawPath = this.parseDestination(match[2]);
 			console.log(`[AttachmentProcessor] Found embedded image #${embedCount}: "${match[0]}" -> parsed path: "${rawPath}"`);
+
+			if (this.isExternalUrl(rawPath)) {
+				if (!seenExternalImageUrl.has(rawPath)) {
+					seenExternalImageUrl.add(rawPath);
+					externalImages.push({ url: rawPath, originalRef: match[0] });
+					console.log(`[AttachmentProcessor]   ✓ Added external image URL for upload: ${rawPath}`);
+				} else {
+					console.log(`[AttachmentProcessor]   ⊚ Duplicate external image URL (already added): ${rawPath}`);
+				}
+				continue;
+			}
 
 			if (this.shouldSkipLinkDestination(rawPath)) {
 				if (this.isTodoUrl(rawPath)) {
@@ -296,14 +473,17 @@ export class AttachmentProcessor {
 			}
 		}
 
-		console.log(`[AttachmentProcessor] Scan complete: ${embedCount} embeds, ${wikiEmbedCount} wiki-embeds, ${linkCount} links, ${wikilinkCount} wikilinks -> ${internal.length} internal attachments, ${external.length} external references`);
-		return { internal, external };
+		console.log(`[AttachmentProcessor] Scan complete: ${embedCount} embeds, ${wikiEmbedCount} wiki-embeds, ${linkCount} links, ${wikilinkCount} wikilinks -> ${internal.length} internal attachments, ${externalImages.length} external images, ${external.length} external references`);
+		return { internal, external, externalImages };
 	}
 
 	private rewriteContent(
 		content: string,
 		sourceFile: TFile,
-		uploadedMap: Map<string, { id: string; file: TFile }>
+		uploadedMap: Map<string, { id: string; file: TFile }>,
+		uploadedExternalMap: Map<string, { id: string; filename: string; extension: string }>,
+		failedLocalFallbackNameByPath: Map<string, string>,
+		failedExternalFallbackNameByUrl: Map<string, string>
 	): AttachmentPrepareResult {
 		const imageUrlToUploadId: Record<string, string> = {};
 		const filePlaceholderToUpload: Record<string, { id: string; name: string }> = {};
@@ -316,15 +496,46 @@ export class AttachmentProcessor {
 				/!\[([^\]]*)\]\(([^)]+)\)/g,
 				(fullMatch, altText, rawDest, offset, input) => {
 					const path = this.parseDestination(rawDest);
+					const inTable = typeof offset === "number" && typeof input === "string"
+						? this.isLikelyInTableLine(input, offset, fullMatch)
+						: false;
+
+					if (this.isExternalUrl(path)) {
+						const uploadedExternal = uploadedExternalMap.get(path);
+					if (!uploadedExternal) {
+						if (inTable) {
+							return this.toSafeTableCellText(failedExternalFallbackNameByUrl.get(path), "image");
+						}
+						return failedExternalFallbackNameByUrl.get(path) ?? fullMatch;
+					}
+					if (inTable) {
+						return this.toSafeTableCellText(altText || uploadedExternal.filename, "image");
+					}
+						const sentinelUrl = this.buildSentinelUrlFromExtension(uploadedExternal.id, uploadedExternal.extension);
+						imageUrlToUploadId[sentinelUrl] = uploadedExternal.id;
+						const markdown = `![${altText}](${sentinelUrl})`;
+						return typeof offset === "number" && typeof input === "string" && this.isStandaloneOnLine(input, offset, fullMatch)
+							? `\n\n${markdown}\n\n`
+							: markdown;
+					}
+
 					if (this.shouldSkipLinkDestination(path)) return fullMatch;
 
 					const file = this.resolveFile(app, sourceFile, path);
 					if (!file) return fullMatch;
 
 				const uploaded = uploadedMap.get(file.path);
-				if (!uploaded) return fullMatch;
+				if (!uploaded) {
+					if (inTable) {
+						return this.toSafeTableCellText(failedLocalFallbackNameByPath.get(file.path) ?? file.name, "file");
+					}
+					return failedLocalFallbackNameByPath.get(file.path) ?? file.name;
+				}
 
 				if (this.isImage(file)) {
+					if (inTable) {
+						return this.toSafeTableCellText(altText || file.name, "image");
+					}
 					const sentinelUrl = this.buildSentinelUrl(uploaded.id, file, altText);
 					imageUrlToUploadId[sentinelUrl] = uploaded.id;
 					const markdown = `![${altText}](${sentinelUrl})`;
@@ -332,6 +543,9 @@ export class AttachmentProcessor {
 						? `\n\n${markdown}\n\n`
 						: markdown;
 				} else {
+					if (inTable) {
+						return this.toSafeTableCellText(file.name, "file");
+					}
 					const token = `__NOTION_FILE_UPLOAD__:${uploaded.id}`;
 					filePlaceholderToUpload[token] = { id: uploaded.id, name: file.name };
 					return `\n\n\`${token}\`\n\n`;
@@ -344,15 +558,26 @@ export class AttachmentProcessor {
 				/!\[\[([^\]]+)\]\]/g,
 				(fullMatch, inner, offset, input) => {
 					const linkPath = this.parseWikilink(inner);
+					const inTable = typeof offset === "number" && typeof input === "string"
+						? this.isLikelyInTableLine(input, offset, fullMatch)
+						: false;
 					if (this.shouldSkipLinkDestination(linkPath)) return fullMatch;
 
 					const file = this.resolveFile(app, sourceFile, linkPath);
 					if (!file) return fullMatch;
 
 				const uploaded = uploadedMap.get(file.path);
-				if (!uploaded) return fullMatch;
+				if (!uploaded) {
+					if (inTable) {
+						return this.toSafeTableCellText(failedLocalFallbackNameByPath.get(file.path) ?? file.name, "file");
+					}
+					return failedLocalFallbackNameByPath.get(file.path) ?? file.name;
+				}
 
 				if (this.isImage(file)) {
+					if (inTable) {
+						return this.toSafeTableCellText(file.name, "image");
+					}
 					const sentinelUrl = this.buildSentinelUrl(uploaded.id, file);
 					imageUrlToUploadId[sentinelUrl] = uploaded.id;
 					const markdown = `![](${sentinelUrl})`;
@@ -360,6 +585,9 @@ export class AttachmentProcessor {
 						? `\n\n${markdown}\n\n`
 						: markdown;
 				} else {
+					if (inTable) {
+						return this.toSafeTableCellText(file.name, "file");
+					}
 					const token = `__NOTION_FILE_UPLOAD__:${uploaded.id}`;
 					filePlaceholderToUpload[token] = { id: uploaded.id, name: file.name };
 					return `\n\n\`${token}\`\n\n`;
@@ -370,15 +598,26 @@ export class AttachmentProcessor {
 		// Rewrite markdown links: [text](path)
 			rewritten = rewritten.replace(
 				/(?<!!)\[([^\]]+)\]\(([^)]+)\)/g,
-				(fullMatch, _linkText, rawDest) => {
+				(fullMatch, _linkText, rawDest, offset, input) => {
 					const path = this.parseDestination(rawDest);
+					const inTable = typeof offset === "number" && typeof input === "string"
+						? this.isLikelyInTableLine(input, offset, fullMatch)
+						: false;
 					if (this.shouldSkipLinkDestination(path)) return fullMatch;
 
 					const file = this.resolveFile(app, sourceFile, path);
 					if (!file) return fullMatch;
 
 				const uploaded = uploadedMap.get(file.path);
-				if (!uploaded) return fullMatch;
+				if (!uploaded) {
+					if (inTable) {
+						return this.toSafeTableCellText(failedLocalFallbackNameByPath.get(file.path) ?? file.name, "file");
+					}
+					return failedLocalFallbackNameByPath.get(file.path) ?? file.name;
+				}
+				if (inTable) {
+					return this.toSafeTableCellText(file.name, "file");
+				}
 
 				// For markdown links, always use file placeholder (non-image treatment)
 				const token = `__NOTION_FILE_UPLOAD__:${uploaded.id}`;
@@ -390,15 +629,26 @@ export class AttachmentProcessor {
 		// Rewrite wikilink references: [[path]]
 			rewritten = rewritten.replace(
 				/(?<!!)\[\[([^\]]+)\]\]/g,
-				(fullMatch, inner) => {
+				(fullMatch, inner, offset, input) => {
 					const linkPath = this.parseWikilink(inner);
+					const inTable = typeof offset === "number" && typeof input === "string"
+						? this.isLikelyInTableLine(input, offset, fullMatch)
+						: false;
 					if (this.shouldSkipLinkDestination(linkPath)) return fullMatch;
 
 					const file = this.resolveFile(app, sourceFile, linkPath);
 					if (!file) return fullMatch;
 
 				const uploaded = uploadedMap.get(file.path);
-				if (!uploaded) return fullMatch;
+				if (!uploaded) {
+					if (inTable) {
+						return this.toSafeTableCellText(failedLocalFallbackNameByPath.get(file.path) ?? file.name, "file");
+					}
+					return failedLocalFallbackNameByPath.get(file.path) ?? file.name;
+				}
+				if (inTable) {
+					return this.toSafeTableCellText(file.name, "file");
+				}
 
 				// For wikilink references, always use file placeholder (non-image treatment)
 				const token = `__NOTION_FILE_UPLOAD__:${uploaded.id}`;
@@ -432,6 +682,14 @@ export class AttachmentProcessor {
 	}
 
 	private decodePathOrUrl(value: string): string {
+		if (this.isExternalUrl(value)) {
+			try {
+				return decodeURI(value);
+			} catch {
+				return value;
+			}
+		}
+
 		/*
 		// TODO: Support `obsidian://` and `app://` URL destinations.
 		// For now we only support wikilink + standard markdown formats with vault paths.
@@ -454,6 +712,74 @@ export class AttachmentProcessor {
 
 	private isExternalUrl(link: string): boolean {
 		return link.startsWith("http://") || link.startsWith("https://");
+	}
+
+	private async downloadExternalImageToTempCache(url: string): Promise<CachedExternalImage> {
+		console.log(`[AttachmentProcessor] Downloading external image: ${url}`);
+		const response = await requestUrl({
+			url,
+			method: "GET",
+			throw: false,
+		});
+
+		if (response.status < 200 || response.status >= 300) {
+			throw new Error(`Failed to download external image: HTTP ${response.status}`);
+		}
+
+		const binary = response.arrayBuffer;
+		const contentTypeHeader = String(response.headers?.["content-type"] ?? response.headers?.["Content-Type"] ?? "");
+		const extension = this.resolveRemoteImageExtension(url, contentTypeHeader);
+		if (!extension) {
+			throw new Error(`Unsupported external image type. URL: ${url}, Content-Type: ${contentTypeHeader || "unknown"}`);
+		}
+
+		const filename = this.resolveRemoteFilename(url, extension);
+		console.log(`[AttachmentProcessor] Cached external image:`, {
+			url,
+			filename,
+			extension,
+			sizeKB: (binary.byteLength / 1024).toFixed(2),
+		});
+
+		return { binary, filename, extension };
+	}
+
+	private resolveRemoteImageExtension(url: string, contentTypeHeader: string): string | null {
+		const cleanUrl = url.split(/[?#]/)[0] ?? url;
+		const byUrl = cleanUrl.includes(".")
+			? (cleanUrl.slice(cleanUrl.lastIndexOf(".") + 1) || "").toLowerCase()
+			: "";
+		if (byUrl && REMOTE_IMAGE_EXTENSIONS.has(byUrl)) {
+			return byUrl;
+		}
+
+		const normalizedContentType = contentTypeHeader.split(";")[0]?.trim().toLowerCase() ?? "";
+		const mappedExt = REMOTE_IMAGE_CONTENT_TYPE_TO_EXT[normalizedContentType];
+		if (mappedExt && REMOTE_IMAGE_EXTENSIONS.has(mappedExt)) {
+			return mappedExt;
+		}
+
+		return null;
+	}
+
+	private resolveRemoteFilename(url: string, extension: string): string {
+		const cleanUrl = url.split(/[?#]/)[0] ?? url;
+		const segments = cleanUrl.split("/").filter(Boolean);
+		const lastSegment = segments[segments.length - 1] ?? "image";
+		const decoded = (() => {
+			try {
+				return decodeURIComponent(lastSegment);
+			} catch {
+				return lastSegment;
+			}
+		})();
+
+		const safeBase = decoded
+			.replace(/\.[^.]+$/, "")
+			.replace(/[^a-zA-Z0-9._-]/g, "_")
+			.slice(0, 80) || "image";
+
+		return `${safeBase}.${extension}`;
 	}
 
 	private isTodoUrl(link: string): boolean {
@@ -630,6 +956,12 @@ export class AttachmentProcessor {
 		const suffix = ext ? `.${ext}` : "";
 		return `https://notion-file-upload.local/${uploadId}${suffix}`;
 	}
+
+	private buildSentinelUrlFromExtension(uploadId: string, extension?: string): string {
+		const ext = extension?.toLowerCase() ?? "";
+		const suffix = ext ? `.${ext}` : "";
+		return `https://notion-file-upload.local/${uploadId}${suffix}`;
+	}
 }
 
 export function applyBlockRewrites(
@@ -659,12 +991,28 @@ function transformBlocksInPlace(
 			}
 		}
 
+		// Fallback: convert standalone markdown image text to image blocks.
+		const markdownImageToken = extractMarkdownImageToken(block, rewrites.imageUrlToUploadId);
+		if (markdownImageToken) {
+			blocks[i] = buildImageBlock(markdownImageToken.uploadId, markdownImageToken.alt);
+			continue;
+		}
+
 		// Transform paragraph placeholders to file blocks
 		if (block?.type === "paragraph") {
 			const token = extractParagraphText(block);
 			if (token && rewrites.filePlaceholderToUpload[token]) {
 				const { id, name } = rewrites.filePlaceholderToUpload[token];
 				blocks[i] = buildFileBlock(id, name);
+			}
+		}
+
+		if (isListItemBlock(block)) {
+			const token = extractListItemText(block);
+			if (token && rewrites.filePlaceholderToUpload[token]) {
+				const { id, name } = rewrites.filePlaceholderToUpload[token];
+				blocks[i] = buildFileBlock(id, name);
+				continue;
 			}
 		}
 
@@ -685,6 +1033,81 @@ function extractParagraphText(block: any): string | undefined {
 		.trim() || undefined;
 }
 
+function extractListItemText(block: any): string | undefined {
+	if (!isListItemBlock(block)) return undefined;
+	const richText = getRichTextFromBlock(block);
+	if (!Array.isArray(richText) || richText.length === 0) return undefined;
+	return richText
+		.map((item: any) => item?.plain_text ?? item?.text?.content ?? "")
+		.join("")
+		.trim() || undefined;
+}
+
+function extractMarkdownImageToken(
+	block: any,
+	imageUrlToUploadId: Record<string, string>
+): { uploadId: string; alt?: string } | null {
+	const richText = getRichTextFromBlock(block);
+	if (!Array.isArray(richText) || richText.length === 0) return null;
+
+	const plainText = richText
+		.map((item: any) => item?.plain_text ?? item?.text?.content ?? "")
+		.join("")
+		.trim();
+
+	if (!plainText) return null;
+
+	const match = plainText.match(/^(?:[-*+]\s+|\d+\.\s+)?!\[([^\]]*)\]\((https:\/\/notion-file-upload\.local\/[^)]+)\)$/);
+	if (match) {
+		const alt = match[1] || undefined;
+		const url = match[2];
+		const uploadId = resolveUploadIdBySentinelUrl(url, imageUrlToUploadId);
+		if (uploadId) {
+			return { uploadId, alt };
+		}
+	}
+
+	for (const item of richText) {
+		const linkUrl = String(item?.href ?? item?.text?.link?.url ?? "");
+		if (!linkUrl || !linkUrl.startsWith("https://notion-file-upload.local/")) continue;
+
+		const uploadId = resolveUploadIdBySentinelUrl(linkUrl, imageUrlToUploadId);
+		if (!uploadId) continue;
+
+		const alt = String(item?.plain_text ?? item?.text?.content ?? "").trim() || undefined;
+		return { uploadId, alt };
+	}
+
+	return null;
+}
+
+function resolveUploadIdBySentinelUrl(
+	url: string,
+	imageUrlToUploadId: Record<string, string>
+): string | undefined {
+	if (imageUrlToUploadId[url]) {
+		return imageUrlToUploadId[url];
+	}
+
+	const match = url.match(/^https:\/\/notion-file-upload\.local\/([a-zA-Z0-9-]+)(?:\.[a-zA-Z0-9]+)?$/);
+	if (!match) return undefined;
+	return match[1];
+}
+
+function getRichTextFromBlock(block: any): any[] | undefined {
+	const type = block?.type;
+	if (!type) return undefined;
+	const payload = block[type];
+	if (!payload || !Array.isArray(payload.rich_text)) return undefined;
+	return payload.rich_text;
+}
+
+function isListItemBlock(block: any): boolean {
+	return block?.type === "bulleted_list_item"
+		|| block?.type === "numbered_list_item"
+		|| block?.type === "to_do";
+}
+
 function buildFileBlock(uploadId: string, name: string): any {
 	return {
 		object: "block",
@@ -692,6 +1115,22 @@ function buildFileBlock(uploadId: string, name: string): any {
 		file: {
 			type: "file_upload",
 			file_upload: { id: uploadId },
+		},
+	};
+}
+
+function buildImageBlock(uploadId: string, alt?: string): any {
+	const caption = alt
+		? [{ type: "text", text: { content: alt } }]
+		: [];
+
+	return {
+		object: "block",
+		type: "image",
+		image: {
+			type: "file_upload",
+			file_upload: { id: uploadId },
+			...(caption.length > 0 ? { caption } : {}),
 		},
 	};
 }

@@ -35,6 +35,8 @@ export const ja = {
 	NotionLinkDisplayDesc: "デフォルトで有効。無効にすると、同期後にfront matterへNotionリンクが追加されません。",
 	AutoCopyNotionLink: "Notionリンクを自動コピー",
 	AutoCopyNotionLinkDesc: "同期完了後、Notionページのリンクをクリップボードに自動コピーします（デフォルト：オン）。",
+	AutoCompressOversizedImages: "大きすぎる画像を自動圧縮",
+	AutoCompressOversizedImagesDesc: "Notion の 5MB アップロード制限を超える画像を、アップロード前に自動圧縮します（デフォルト：オン）。",
 	AutoSync: "自動同期",
 	AutoSyncDesc: "ファイルの内容（frontmatterまたは本文）が変更されると、自動でNotionに同期します。新規作成と更新の両方に対応。",
 	AutoSyncFrontmatterKey: "自動同期 frontmatter キー",
